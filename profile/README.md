@@ -203,7 +203,7 @@ Each repo has its own contributing section with repo-specific conventions. Org-w
 
 ## License
 
-TBD — a license will be added before public release.
+MIT
 
 ---
 
