@@ -50,11 +50,11 @@ This is achieved through an **embedded, custodial wallet model**: Featherpay gen
 1. A creator signs up with email. Featherpay silently provisions them a Stellar wallet.
 2. The creator gets a shareable tip link (`featherpay.io/@creatorname`) or an embeddable widget for their own site.
 3. A reader/viewer/fan clicks "Tip $2," enters card details in a standard hosted payment form, and confirms.
-4. Behind the scenes: the card charge is processed, converted to USDC, and (depending on batching strategy) either settled immediately or pooled with other small tips for periodic on-chain settlement.
-5. The transaction is built by the API layer, signed by the wallet custody service (never exposing the private key), and submitted to the Stellar network.
+4. Behind the scenes: the card charge is processed and converted to USDC — this conversion step may be pooled with other small tips over a short window to keep processing costs down.
+5. The API layer builds a call into the `TipRouter` smart contract's `send_tip` function, sends it to the wallet custody service for signing (never exposing the private key), and submits it to the Stellar network. The contract itself pulls the converted funds from the tipper and forwards them to the creator — and to a Featherpay treasury account, if a protocol fee applies — atomically, in one transaction.
 6. The creator's dashboard balance updates. They can withdraw to their bank account at any time via a fiat off-ramp.
 
-From the outside, steps 4–5 are invisible. It looks like Venmo. It settles like Stellar.
+From the outside, steps 4–5 are invisible. It looks like Venmo. It settles like Stellar — routed, atomically, through a smart contract.
 
 ## Architecture
 
@@ -82,24 +82,26 @@ From the outside, steps 4–5 are invisible. It looks like Venmo. It settles lik
                              │   never exposed        │  │   conversion,        │
                              │   publicly)            │  │   bank payouts)      │
                              └─────────┬────────┘  └──────────────────┘
-                                       │ signed txns
+                                       │ signed call into
+                                       │ TipRouter.send_tip(...)
                                        ▼
                              ┌──────────────────┐
-                             │   Stellar Network   │
-                             │   (Soroban RPC)      │
+                             │  contracts            │
+                             │  (TipRouter contract —  │
+                             │   pulls funds from        │
+                             │   tipper, forwards to      │
+                             │   creator + treasury,       │
+                             │   atomically)                 │
                              └─────────┬────────┘
                                        │
                                        ▼
                              ┌──────────────────┐
-                             │  contracts           │
-                             │  (optional — on-chain  │
-                             │   tip records, fee      │
-                             │   splits; deferred       │
-                             │   until needed)          │
+                             │   Stellar Network    │
+                             │   (Soroban RPC)        │
                              └──────────────────┘
 ```
 
-**Design principle:** the service that talks to users (`frontend`) never talks to the service that holds keys (`wallet-service`). Every request to sign something is mediated by `api`, and `wallet-service` is unreachable from the public internet entirely.
+**Design principle:** the service that talks to users (`frontend`) never talks to the service that holds keys (`wallet-service`). Every request to sign something is mediated by `api`, and `wallet-service` is unreachable from the public internet entirely. Every tip, without exception, is routed through the `TipRouter` contract in `contracts` — `api` never constructs a plain point-to-point transfer for a tip — so that the payment and any protocol fee split happen atomically, and every tip is independently verifiable from the contract's on-chain events.
 
 ## Repositories
 
@@ -108,7 +110,7 @@ From the outside, steps 4–5 are invisible. It looks like Venmo. It settles lik
 | [`wallet-service`](https://github.com/featherpay/wallet-service) | Embedded wallet custody: keypair generation, encrypted storage, signing, recovery. The most security-sensitive repo in the org — internal-only, no public surface. | In development |
 | [`api`](https://github.com/featherpay/api) | Orchestration layer: accounts, fiat on/off-ramp, tip processing, batching, ledger, reconciliation. | In development |
 | [`frontend`](https://github.com/featherpay/frontend) | Tip widget, embeddable snippet, creator dashboard. No crypto terminology anywhere in the UI. | In development |
-| [`contracts`](https://github.com/featherpay/contracts) | Optional Soroban contracts for on-chain tip records and fee-splitting. Intentionally deferred until a concrete product need justifies the added complexity and audit surface — see that repo's PLAN.md for the activation criteria. | Deferred by design |
+| [`contracts`](https://github.com/featherpay/contracts) | The `TipRouter` Soroban contract that every tip is routed through — receives the payment from the tipper and forwards it to the creator (and a treasury, if a fee applies) atomically. A required, active part of the core payment path, not an optional layer. | In development |
 
 Each repo has its own `PLAN.md` (milestones, design decisions, risks) and `README.md` (setup, architecture, API reference).
 
@@ -117,7 +119,7 @@ Each repo has its own `PLAN.md` (milestones, design decisions, risks) and `READM
 - **Sub-cent settlement fees** — the fee floor that makes $0.50–$5 payments economically sane in the first place
 - **Fast finality** (seconds, not minutes) — a tip should feel instant even if the underlying settlement is deliberately batched
 - **Native asset issuance and anchors** — USDC is available natively on Stellar, and the anchor network provides established fiat on/off-ramp infrastructure rather than requiring Featherpay to build banking relationships from scratch
-- **Soroban** — if/when on-chain logic (tip records, fee splits) becomes worth building, Stellar's smart contract platform is available without switching ecosystems
+- **Soroban** — every tip is routed through the `TipRouter` smart contract, which atomically forwards a tip to its creator and splits off a protocol fee where applicable; Soroban is what makes that atomicity possible without a second, separate settlement step
 
 ## The Embedded Wallet Model
 
@@ -133,7 +135,7 @@ This is the architectural decision that makes Featherpay usable by a mainstream,
 
 A common misconception worth correcting up front: **Stellar's fee is not the bottleneck for a $1 tip funded by a card.** Card network and processor fees (often 30¢ plus a percentage) dominate the cost stack at that size — Stellar's near-zero fee only delivers its promise once the fiat-processing side is accounted for.
 
-Featherpay addresses this by **batching**: individual tips are recorded immediately in the internal ledger (so creator balances update in near-real-time from the user's perspective), while the underlying on-chain settlement and fiat conversion are pooled across a short window and executed in fewer, larger transactions. This is what actually makes "near-zero fees" true in practice, not just in theory.
+Featherpay addresses this in two layers. First, individual tips are recorded immediately in the internal ledger, so creator balances update in near-real-time from the user's perspective, regardless of what's happening on-chain. Second, the **fiat-side** conversion and off-ramp operations are pooled across a short window to reduce processor overhead — this is where most of the cost savings actually come from at micropayment scale. On-chain settlement itself happens **per tip**, via a signed call into the `TipRouter` contract, since the contract requires each tipper's individual authorization; this is fine because Stellar's own transaction fee is already a fraction of a cent, batching or not. The atomicity the contract provides — tip and fee split succeeding or failing together — is worth more than pooling on-chain calls would save.
 
 ## Security
 
@@ -168,12 +170,13 @@ High-level, org-wide view — see each repo's `PLAN.md` for full milestone detai
 
 1. **Foundations** — repo scaffolding, threat modeling for `wallet-service`, core data models
 2. **Embedded wallet + signing** — keypair generation, encrypted storage, signing service
-3. **Tip flow v1** — card payment → USDC conversion → signed transfer → creator balance update
-4. **Batching** — pool small tips to make the fee economics actually work
-5. **Creator dashboard + withdrawals** — earnings view, bank payout flow
-6. **Security hardening + audit** — internal review, third-party penetration test on `wallet-service`, broader audit before real funds
-7. **Testnet beta** — real (small) fiat flows against testnet, real creators
-8. **Mainnet launch** — gated on legal sign-off for custodial money-transmission questions, launched with conservative tip/withdrawal caps
+3. **`TipRouter` contract v1** — Soroban contract that atomically receives a tip and forwards it to the creator, with optional fee splitting
+4. **Tip flow v1** — card payment → USDC conversion → signed call into `TipRouter` → creator balance update
+5. **Fiat-side batching** — pool small tips' conversion/off-ramp operations to make the fee economics actually work
+6. **Creator dashboard + withdrawals** — earnings view, bank payout flow
+7. **Security hardening + audit** — internal review, third-party penetration test on `wallet-service`, dedicated audit on the `TipRouter` contract given it routes every tip's funds, broader audit before real funds
+8. **Testnet beta** — real (small) fiat flows against testnet, real creators
+9. **Mainnet launch** — gated on legal sign-off for custodial money-transmission questions, launched with conservative tip/withdrawal caps enforced at both the `api` and contract level
 
 ## FAQ
 
@@ -187,7 +190,7 @@ Yes, by design, for v1 — see [The Embedded Wallet Model](#the-embedded-wallet-
 Their fixed-cost fees make sub-$5 payments uneconomical. Featherpay exists specifically to make that size of payment viable, using Stellar's near-zero settlement cost combined with batching to also absorb the fiat-side processing costs.
 
 **Is there an on-chain smart contract?**
-Optionally, later. The MVP uses direct signed transfers orchestrated by `api`. A Soroban contract layer (`contracts`) is deferred until a concrete need — like a public tip leaderboard or complex fee-splitting — justifies the added complexity and audit surface.
+Yes — every tip is routed through the `TipRouter` Soroban contract in `contracts`. It receives the tip payment from the tipper and forwards it to the creator, splitting off a protocol fee to a treasury account where applicable, all in one atomic transaction. `api` never builds a plain wallet-to-wallet transfer for a tip.
 
 **Has this been audited?**
 Not yet. See [Security](#security).
